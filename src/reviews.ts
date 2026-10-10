@@ -38,9 +38,20 @@ export function createCampaign(db: DatabaseSync, name: string, requiredPieces: P
   return getCampaign(db, id);
 }
 
-export function getDelivery(db: DatabaseSync, id: string) {
+function deliveryRow(db: DatabaseSync, id: string) {
   const delivery = db.prepare("SELECT * FROM deliveries WHERE id = ?").get(id) as DeliveryRow | undefined;
   if (!delivery) throw new ReviewError("entrega não encontrada", 404);
+  return delivery;
+}
+
+function currentVersionNumber(db: DatabaseSync, deliveryId: string, type: PieceType): number {
+  const row = db.prepare("SELECT MAX(number) AS number FROM versions WHERE delivery_id = ? AND piece_type = ?")
+    .get(deliveryId, type) as { number: number | null };
+  return row.number ?? 0;
+}
+
+export function getDelivery(db: DatabaseSync, id: string) {
+  const delivery = deliveryRow(db, id);
   const campaign = getCampaign(db, delivery.campaign_id);
   const versions = db.prepare("SELECT * FROM versions WHERE delivery_id = ? ORDER BY number").all(id) as VersionRow[];
   const comments = db.prepare(`
@@ -49,7 +60,6 @@ export function getDelivery(db: DatabaseSync, id: string) {
   `).all(id) as CommentRow[];
 
   const pieces = pieceTypes
-    .filter((type) => campaign.required_pieces.includes(type) || versions.some((version) => version.piece_type === type))
     .map((type) => {
       const history = versions.filter((version) => version.piece_type === type).map((version) => ({
         ...version,
@@ -63,7 +73,8 @@ export function getDelivery(db: DatabaseSync, id: string) {
         status: current?.status ?? "missing",
         versions: history,
       };
-    });
+    })
+    .filter((piece) => piece.required || piece.versions.length > 0);
   const pendingPieces: PendingPiece[] = pieces
     .filter((piece) => piece.required && piece.status !== "approved")
     .map((piece) => ({ piece_type: piece.type, reason: piece.status === "missing" ? "missing" : "not_approved" }));
@@ -94,14 +105,13 @@ export function getVersion(db: DatabaseSync, id: string) {
 
 export function submitVersion(db: DatabaseSync, deliveryId: string, type: PieceType, input: VersionInput, now: Date) {
   return transaction(db, () => {
-    getDelivery(db, deliveryId);
-    const current = db.prepare("SELECT MAX(number) AS number FROM versions WHERE delivery_id = ? AND piece_type = ?")
-      .get(deliveryId, type) as { number: number | null };
+    deliveryRow(db, deliveryId);
+    const number = currentVersionNumber(db, deliveryId, type) + 1;
     const id = randomUUID();
     db.prepare(`
       INSERT INTO versions (id, delivery_id, piece_type, number, content, url, duration_seconds, status, submitted_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-    `).run(id, deliveryId, type, (current.number ?? 0) + 1, input.content, input.url, input.duration_seconds, now.toISOString());
+    `).run(id, deliveryId, type, number, input.content, input.url, input.duration_seconds, now.toISOString());
     return getVersion(db, id);
   });
 }
@@ -109,9 +119,8 @@ export function submitVersion(db: DatabaseSync, deliveryId: string, type: PieceT
 export function approveVersion(db: DatabaseSync, id: string, now: Date) {
   return transaction(db, () => {
     const version = getVersion(db, id);
-    const current = db.prepare("SELECT MAX(number) AS number FROM versions WHERE delivery_id = ? AND piece_type = ?")
-      .get(version.delivery_id, version.piece_type) as { number: number };
-    if (version.number !== current.number) throw new ReviewError("só a versão atual pode ser aprovada", 409);
+    const current = currentVersionNumber(db, version.delivery_id, version.piece_type);
+    if (version.number !== current) throw new ReviewError("só a versão atual pode ser aprovada", 409);
     if (version.status === "pending") {
       db.prepare("UPDATE versions SET status = 'approved', approved_at = ? WHERE id = ?")
         .run(now.toISOString(), id);

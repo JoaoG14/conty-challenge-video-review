@@ -51,8 +51,8 @@ describe("revisão de vídeos", () => {
     return (await response.json() as Delivery).id;
   }
 
-  async function submit(deliveryId: string, type: PieceType = "video"): Promise<Version> {
-    const response = await post(`/deliveries/${deliveryId}/pieces/${type}/versions`, inputs[type]);
+  async function submit(deliveryId: string, type: PieceType = "video", input = inputs[type]): Promise<Version> {
+    const response = await post(`/deliveries/${deliveryId}/pieces/${type}/versions`, input);
     expect(response.status).toBe(201);
     return response.json() as Promise<Version>;
   }
@@ -75,17 +75,14 @@ describe("revisão de vídeos", () => {
     return response.json() as Promise<Version>;
   }
 
-  it("usa as exigências de cada campanha e aprova uma campanha só de vídeo sem roteiro", async () => {
-    const videoOnly = await create();
-    const withCover = await create(["video", "cover"]);
-    await approve((await submit(videoOnly)).id);
-    await approve((await submit(withCover)).id);
-    expect(await read(videoOnly)).toMatchObject({ status: "approved", required_pieces: ["video"], pending_pieces: [] });
-    expect((await post(`/deliveries/${videoOnly}/approve`)).status).toBe(200);
-    expect(await read(withCover)).toMatchObject({ status: "in_production", pending_pieces: [{ piece_type: "cover", reason: "missing" }] });
-    const delivery = await read(withCover);
+  it("aprova uma campanha só de vídeo sem exigir roteiro", async () => {
+    const id = await create();
+    await approve((await submit(id)).id);
+    const delivery = await read(id);
+    expect(delivery).toMatchObject({ status: "approved", required_pieces: ["video"], pending_pieces: [] });
+    expect((await post(`/deliveries/${id}/approve`)).status).toBe(200);
     expect(await (await app.request(`/campaigns/${delivery.campaign_id}`)).json())
-      .toMatchObject({ required_pieces: ["video", "cover"] });
+      .toMatchObject({ required_pieces: ["video"] });
   });
 
   it("retorna as peças ausentes e sem aprovação sem aprovar nada por engano", async () => {
@@ -103,6 +100,9 @@ describe("revisão de vídeos", () => {
     });
     expect(await read(id)).toEqual(before);
     await approve(video.id);
+    expect(await read(id)).toMatchObject({
+      status: "in_production", pending_pieces: [{ piece_type: "cover", reason: "missing" }],
+    });
     await submit(id, "cover");
     expect(await (await post(`/deliveries/${id}/approve`)).json()).toMatchObject({
       pending_pieces: [{ piece_type: "cover", reason: "not_approved" }],
@@ -140,11 +140,12 @@ describe("revisão de vídeos", () => {
     expect(await readVersion(old.id)).toEqual(old);
     expect(await readVersion(unchanged.id)).toEqual(unchanged);
 
-    await approve(current.id);
+    const approved = await approve(current.id);
     const result = await read(id);
     expect(result.status).toBe("approved");
-    expect(result.pieces.find((piece) => piece.type === type)).toMatchObject({ current_version: 2 });
-    expect(result.pieces.find((piece) => piece.type === type)!.versions).toHaveLength(2);
+    expect(result.pieces.find((piece) => piece.type === type)).toMatchObject({
+      current_version: 2, versions: [old, approved],
+    });
   });
 
   it("não bloqueia por peça opcional, nem por uma nova versão dela", async () => {
@@ -183,9 +184,7 @@ describe("revisão de vídeos", () => {
     const first = await submit(id);
     expect((await post(`/versions/${first.id}/comments`, { second: 12.5, text: "Mostrar a embalagem." })).status).toBe(201);
     await approve(first.id);
-    const response = await post(`/deliveries/${id}/pieces/video/versions`, { ...inputs.video, duration_seconds: 5 });
-    expect(response.status).toBe(201);
-    const second = await response.json() as Version;
+    const second = await submit(id, "video", { ...inputs.video, duration_seconds: 5 });
     expect((await post(`/versions/${first.id}/comments`, { second: 20, text: "Rever o final da v1." })).status).toBe(201);
     expect((await post(`/versions/${second.id}/comments`, { second: 12.5, text: "Fora da v2." })).status).toBe(400);
     expect((await readVersion(first.id)).comments).toMatchObject([
@@ -234,6 +233,7 @@ describe("revisão de vídeos", () => {
     ["video", { url: "https://example.com/video.mp4", duration_seconds: 0 }],
     ["video", { url: "https://example.com/video.mp4" }],
     ["cover", { url: "javascript:alert(1)" }],
+    ["cover", { url: "endereço inválido" }],
     ["caption", { content: " " }],
     ["audio", { url: "https://example.com/audio.mp3" }],
   ])("rejeita dados inválidos de %s sem criar uma versão", async (type, input) => {

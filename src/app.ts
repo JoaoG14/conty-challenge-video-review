@@ -47,13 +47,8 @@ function requiredPieces(value: unknown): PieceType[] {
 
 function mediaUrl(body: Record<string, unknown>): string {
   const value = requiredText(body, "url");
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new ReviewError("url deve ser um endereço HTTP ou HTTPS válido", 400);
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
+  const protocol = URL.parse(value)?.protocol;
+  if (protocol !== "http:" && protocol !== "https:") {
     throw new ReviewError("url deve ser um endereço HTTP ou HTTPS válido", 400);
   }
   return value;
@@ -63,7 +58,7 @@ export function createApp(db: DatabaseSync, now: () => Date = () => new Date()) 
   const app = new Hono();
   app.onError((error, c) => {
     if (error instanceof ReviewError) {
-      return c.json({ error: error.message, ...(error.pending_pieces ? { pending_pieces: error.pending_pieces } : {}) }, error.status);
+      return c.json({ error: error.message, pending_pieces: error.pending_pieces }, error.status);
     }
     console.error(error);
     return c.json({ error: "erro interno" }, 500);
