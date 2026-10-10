@@ -34,10 +34,10 @@ describe("revisão de vídeos", () => {
     directory = undefined;
   });
 
-  function post(path: string, body?: unknown) {
+  function post(path: string, body?: unknown, headers: Record<string, string> = {}) {
     return app.request(path, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   }
@@ -179,6 +179,87 @@ describe("revisão de vídeos", () => {
     expect(await approve(version.id)).toEqual(firstApproval);
   });
 
+  it("repete um envio sem criar outra versão nem desfazer sua aprovação", async () => {
+    const id = await create();
+    const path = `/deliveries/${id}/pieces/video/versions`;
+    const headers = { "Idempotency-Key": "video-1" };
+    const response = await post(path, inputs.video, headers);
+    expect(response.status).toBe(201);
+    const version = await response.json() as Version;
+    await approve(version.id);
+    await post(`/versions/${version.id}/comments`, { second: 12, text: "Rever a embalagem." });
+    const before = await read(id);
+
+    time = "2026-10-12T12:00:00.000Z";
+    const repeated = await post(path, { duration_seconds: 30, url: ` ${inputs.video.url} ` }, headers);
+    expect(repeated.status).toBe(200);
+    expect(await repeated.json()).toEqual(await readVersion(version.id));
+    expect(await read(id)).toEqual(before);
+    expect(before.status).toBe("approved");
+
+    const nextResponse = await post(path, inputs.video, { "Idempotency-Key": "video-2" });
+    expect(nextResponse.status).toBe(201);
+    expect(await nextResponse.json()).toMatchObject({ number: 2, status: "pending" });
+    const afterNewVersion = await read(id);
+    const lateRetry = await post(path, inputs.video, headers);
+    expect(lateRetry.status).toBe(200);
+    expect(await lateRetry.json()).toMatchObject({ id: version.id, number: 1 });
+    expect(await read(id)).toEqual(afterNewVersion);
+    expect(afterNewVersion.status).toBe("in_production");
+  });
+
+  it.each([
+    ["video", { ...inputs.video, url: "https://example.com/outro.mp4" }],
+    ["video", { ...inputs.video, duration_seconds: 31 }],
+    ["script", { content: "Outro roteiro." }],
+  ] as const)("rejeita a mesma chave com dados diferentes de %s", async (type, input) => {
+    const id = await create([type]);
+    const path = `/deliveries/${id}/pieces/${type}/versions`;
+    const headers = { "Idempotency-Key": "envio-1" };
+    const first = await post(path, inputs[type], headers);
+    expect(first.status).toBe(201);
+    await approve((await first.json() as Version).id);
+    const before = await read(id);
+    const response = await post(path, input, headers);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "chave de idempotência já usada com dados diferentes" });
+    expect(await read(id)).toEqual(before);
+    expect((await post(path, inputs[type], headers)).status).toBe(200);
+  });
+
+  it("isola a chave por entrega e tipo de peça", async () => {
+    const firstId = await create();
+    const secondId = await create();
+    const headers = { "Idempotency-Key": "envio-1" };
+    const versions: string[] = [];
+    for (const [id, type] of [[firstId, "video"], [firstId, "cover"], [secondId, "video"]] as const) {
+      const path = `/deliveries/${id}/pieces/${type}/versions`;
+      const response = await post(path, inputs[type], headers);
+      expect(response.status).toBe(201);
+      const version = await response.json() as Version;
+      expect(version.number).toBe(1);
+      versions.push(version.id);
+      const repeated = await post(path, inputs[type], headers);
+      expect(repeated.status).toBe(200);
+      expect(await repeated.json()).toEqual(version);
+    }
+    expect(new Set(versions).size).toBe(3);
+  });
+
+  it("rejeita chave vazia e permite corrigir um envio inválido com a mesma chave", async () => {
+    const id = await create();
+    const path = `/deliveries/${id}/pieces/video/versions`;
+    const empty = await post(path, inputs.video, { "Idempotency-Key": " " });
+    expect(empty.status).toBe(400);
+    expect(await empty.json()).toEqual({ error: "Idempotency-Key não pode ser vazio" });
+    const headers = { "Idempotency-Key": "envio-1" };
+    expect((await post(path, { ...inputs.video, duration_seconds: 0 }, headers)).status).toBe(400);
+    expect((await read(id)).pieces[0].versions).toEqual([]);
+    const response = await post(path, inputs.video, headers);
+    expect(response.status).toBe(201);
+    expect(await response.json()).toMatchObject({ number: 1 });
+  });
+
   it("mantém comentários na versão original, inclusive comentários feitos depois da substituição", async () => {
     const id = await create();
     const first = await submit(id);
@@ -275,7 +356,7 @@ describe("revisão de vídeos", () => {
     expect((await read(firstId)).status).toBe("approved");
   });
 
-  it("preserva a campanha, versões, comentários e pendências ao reabrir o banco", async () => {
+  it("preserva versões, comentários, pendências e chaves ao reabrir o banco", async () => {
     directory = mkdtempSync(join(tmpdir(), "conty-video-review-"));
     const path = join(directory, "reviews.sqlite");
     db.close();
@@ -286,13 +367,22 @@ describe("revisão de vídeos", () => {
     await post(`/versions/${first.id}/comments`, { second: 12, text: "Comentário da primeira versão." });
     await approve(first.id);
     await approve((await submit(id, "cover")).id);
-    const next = await submit(id);
+    const versionPath = `/deliveries/${id}/pieces/video/versions`;
+    const headers = { "Idempotency-Key": "video-2" };
+    const response = await post(versionPath, inputs.video, headers);
+    expect(response.status).toBe(201);
+    const next = await response.json() as Version;
     const before = await read(id);
     db.close();
     db = openDatabase(path);
     app = createApp(db, () => new Date(time));
     expect(await read(id)).toEqual(before);
     await approve(next.id);
-    expect((await read(id)).status).toBe("approved");
+    const approved = await read(id);
+    expect(approved.status).toBe("approved");
+    const repeated = await post(versionPath, inputs.video, headers);
+    expect(repeated.status).toBe(200);
+    expect(await repeated.json()).toEqual(await readVersion(next.id));
+    expect(await read(id)).toEqual(approved);
   });
 });

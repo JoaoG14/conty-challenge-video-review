@@ -82,6 +82,8 @@ export function createApp(db: DatabaseSync, now: () => Date = () => new Date()) 
   app.post("/deliveries/:id/pieces/:type/versions", async (c) => {
     const body = await readBody(c);
     const type = pieceType(c.req.param("type"));
+    const idempotencyKey = c.req.header("Idempotency-Key")?.trim() ?? null;
+    if (idempotencyKey === "") throw new ReviewError("Idempotency-Key não pode ser vazio", 400);
     let content: string | null = null;
     let url: string | null = null;
     let duration: number | null = null;
@@ -94,9 +96,10 @@ export function createApp(db: DatabaseSync, now: () => Date = () => new Date()) 
         if (duration === 0) throw new ReviewError("duration_seconds deve ser maior que zero", 400);
       }
     }
-    return c.json(submitVersion(db, c.req.param("id"), type, {
+    const result = submitVersion(db, c.req.param("id"), type, {
       content, url, duration_seconds: duration,
-    }, now()), 201);
+    }, now(), idempotencyKey);
+    return c.json(result.version, result.repeated ? 200 : 201);
   });
 
   app.get("/versions/:id", (c) => c.json(getVersion(db, c.req.param("id"))));

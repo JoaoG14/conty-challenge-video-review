@@ -43,6 +43,14 @@ export function openDatabase(path = ":memory:"): DatabaseSync {
       CHECK ((status = 'pending' AND approved_at IS NULL) OR (status = 'approved' AND approved_at IS NOT NULL))
     );
 
+    CREATE TABLE IF NOT EXISTS version_requests (
+      delivery_id TEXT NOT NULL REFERENCES deliveries(id),
+      piece_type TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      version_id TEXT NOT NULL REFERENCES versions(id),
+      PRIMARY KEY (delivery_id, piece_type, idempotency_key)
+    );
+
     CREATE TABLE IF NOT EXISTS comments (
       id TEXT PRIMARY KEY,
       version_id TEXT NOT NULL REFERENCES versions(id),

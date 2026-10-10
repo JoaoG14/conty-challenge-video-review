@@ -103,16 +103,36 @@ export function getVersion(db: DatabaseSync, id: string) {
   return { ...version, comments };
 }
 
-export function submitVersion(db: DatabaseSync, deliveryId: string, type: PieceType, input: VersionInput, now: Date) {
+export function submitVersion(
+  db: DatabaseSync, deliveryId: string, type: PieceType, input: VersionInput, now: Date, idempotencyKey: string | null,
+) {
   return transaction(db, () => {
     deliveryRow(db, deliveryId);
+    if (idempotencyKey !== null) {
+      const request = db.prepare(`
+        SELECT version_id FROM version_requests
+        WHERE delivery_id = ? AND piece_type = ? AND idempotency_key = ?
+      `).get(deliveryId, type, idempotencyKey) as { version_id: string } | undefined;
+      if (request) {
+        const version = getVersion(db, request.version_id);
+        if (version.content !== input.content || version.url !== input.url || version.duration_seconds !== input.duration_seconds) {
+          throw new ReviewError("chave de idempotência já usada com dados diferentes", 409);
+        }
+        return { version, repeated: true };
+      }
+    }
     const number = currentVersionNumber(db, deliveryId, type) + 1;
     const id = randomUUID();
     db.prepare(`
       INSERT INTO versions (id, delivery_id, piece_type, number, content, url, duration_seconds, status, submitted_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
     `).run(id, deliveryId, type, number, input.content, input.url, input.duration_seconds, now.toISOString());
-    return getVersion(db, id);
+    if (idempotencyKey !== null) {
+      db.prepare(`
+        INSERT INTO version_requests (delivery_id, piece_type, idempotency_key, version_id) VALUES (?, ?, ?, ?)
+      `).run(deliveryId, type, idempotencyKey, id);
+    }
+    return { version: getVersion(db, id), repeated: false };
   });
 }
 
